@@ -105,6 +105,23 @@ def upload_product_file(token, product_id, filepath):
         logger.error(f"Error uploading file to Gumroad: {e}")
     return False
 
+def publish_product(token, product_id):
+    """Publishes (enables) the product on Gumroad so it is live for buyers."""
+    url = f"https://api.gumroad.com/v2/products/{product_id}/enable"
+    headers = {"Authorization": f"Bearer {token}"}
+    
+    logger.info(f"Publishing product {product_id} to make it live...")
+    try:
+        r = requests.put(url, headers=headers, timeout=15)
+        if r.status_code == 200:
+            logger.info("✅ Product published successfully and is now live on Gumroad!")
+            return True
+        else:
+            logger.error(f"❌ Failed to publish product: HTTP {r.status_code} - {r.text}")
+    except Exception as e:
+        logger.error(f"Error publishing product on Gumroad: {e}")
+    return False
+
 def main():
     token = get_gumroad_token()
     if not token:
@@ -126,7 +143,10 @@ def main():
             return
             
     # Upload/Update the CSV file
-    upload_product_file(token, product_id, CSV_FILE)
+    uploaded = upload_product_file(token, product_id, CSV_FILE)
+    if uploaded:
+        # Publish/Enable the product
+        publish_product(token, product_id)
 
 if __name__ == "__main__":
     main()
