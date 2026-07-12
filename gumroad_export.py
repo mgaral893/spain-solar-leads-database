@@ -1,31 +1,33 @@
 #!/usr/bin/env python3
 """
-Gumroad Database Sync Engine
-=============================
-Automates product creation and file uploads to Gumroad using the Gumroad API v2.
-Reads token from GUMROAD_TOKEN environment variable.
+Gumroad and Google Drive Sync Engine
+======================================
+1. Uploads/Updates the B2B leads database CSV to Google Drive (using gws).
+2. Sets public read permissions on Google Drive so it is downloadable.
+3. Ensures the Gumroad product is published/enabled via API.
 """
 import os
 import json
 import logging
+import subprocess
 import requests
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger("gumroad_sync")
+logger = logging.getLogger("sync_engine")
 
 CONFIG_FILE = "gumroad_config.json"
 CSV_FILE = "instaladores_solares_espana.csv"
+GWS_PATH = "/home/ubuntu/.local/bin/gws"
+GDRIVE_PARENT_FOLDER = "1iOg0JEXQokgW16LQMsezeSm_-rIF_6h9"
 
 def get_gumroad_token():
-    """Retrieve the Gumroad API token from environment."""
     token = os.environ.get("GUMROAD_TOKEN")
     if not token:
-        logger.error("❌ GUMROAD_TOKEN environment variable not set. Please export it before running.")
+        logger.error("❌ GUMROAD_TOKEN environment variable not set.")
         return None
     return token.strip()
 
 def load_config():
-    """Load cached Gumroad product configuration."""
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, "r") as f:
@@ -35,7 +37,6 @@ def load_config():
     return {}
 
 def save_config(config):
-    """Save Gumroad product configuration."""
     try:
         with open(CONFIG_FILE, "w") as f:
             json.dump(config, f, indent=4)
@@ -43,14 +44,12 @@ def save_config(config):
     except Exception as e:
         logger.error(f"Failed to save config: {e}")
 
-def create_product(token):
-    """Create a new product on Gumroad and return the product ID."""
+def create_gumroad_product(token):
     url = "https://api.gumroad.com/v2/products"
     headers = {"Authorization": f"Bearer {token}"}
-    
     payload = {
         "name": "Base de Datos de Instaladores de Placas Solares en España (Leads B2B)",
-        "price": "2900",  # $29.00 in cents
+        "price": "2900",  # $29.00
         "description": (
             "Directorio comercial verificado de empresas de energía solar y autoconsumo en España.\n\n"
             "Incluye:\n"
@@ -64,63 +63,85 @@ def create_product(token):
         "shown_on_profile": "true"
     }
     
-    logger.info("Registering new product on Gumroad...")
+    logger.info("Registering product on Gumroad...")
     try:
         r = requests.post(url, data=payload, headers=headers, timeout=15)
         if r.status_code in [200, 201]:
             res = r.json()
             product = res.get("product", {})
-            product_id = product.get("id")
-            short_url = product.get("short_url")
-            logger.info(f"✅ Product created successfully! ID: {product_id} | Link: {short_url}")
-            return product_id
-        else:
-            logger.error(f"❌ Failed to create product: HTTP {r.status_code} - {r.text}")
+            return product.get("id")
     except Exception as e:
-        logger.error(f"Error during product registration: {e}")
+        logger.error(f"Error registering product on Gumroad: {e}")
     return None
 
-def upload_product_file(token, product_id, filepath):
-    """Uploads the B2B CSV file to the Gumroad product as the main deliverable."""
-    if not os.path.exists(filepath):
-        logger.error(f"❌ Target database file not found: {filepath}")
-        return False
-        
-    # Gumroad API v2 allows attaching files by sending multi-part form data to
-    # PUT /v2/products/:product_id
-    url = f"https://api.gumroad.com/v2/products/{product_id}"
-    headers = {"Authorization": f"Bearer {token}"}
-    
-    logger.info(f"Uploading database file {filepath} to product {product_id}...")
-    try:
-        with open(filepath, "rb") as f:
-            files = {"file": f}
-            r = requests.put(url, headers=headers, files=files, timeout=30)
-            if r.status_code == 200:
-                logger.info("✅ Database file uploaded and synchronized successfully to Gumroad!")
-                return True
-            else:
-                logger.error(f"❌ Upload failed: HTTP {r.status_code} - {r.text}")
-    except Exception as e:
-        logger.error(f"Error uploading file to Gumroad: {e}")
-    return False
-
-def publish_product(token, product_id):
-    """Publishes (enables) the product on Gumroad so it is live for buyers."""
+def publish_gumroad_product(token, product_id):
     url = f"https://api.gumroad.com/v2/products/{product_id}/enable"
     headers = {"Authorization": f"Bearer {token}"}
-    
-    logger.info(f"Publishing product {product_id} to make it live...")
+    logger.info("Publishing product on Gumroad to make it live...")
     try:
         r = requests.put(url, headers=headers, timeout=15)
         if r.status_code == 200:
-            logger.info("✅ Product published successfully and is now live on Gumroad!")
+            logger.info("✅ Product status on Gumroad is now enabled/live!")
             return True
-        else:
-            logger.error(f"❌ Failed to publish product: HTTP {r.status_code} - {r.text}")
     except Exception as e:
-        logger.error(f"Error publishing product on Gumroad: {e}")
+        logger.error(f"Error publishing Gumroad product: {e}")
     return False
+
+def sync_to_google_drive(config):
+    file_id = config.get("gdrive_file_id")
+    
+    if not file_id:
+        logger.info("First run: Uploading file to Google Drive...")
+        # Create file in designated parents
+        cmd = [
+            GWS_PATH, "drive", "files", "create",
+            "--upload", CSV_FILE,
+            "--json", json.dumps({"name": "instaladores_solares_espana.csv", "parents": [GDRIVE_PARENT_FOLDER]})
+        ]
+        try:
+            res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            # Find JSON boundary in output (to bypass keyring noise if any)
+            out_text = res.stdout.strip()
+            if "{" in out_text:
+                json_part = out_text[out_text.index("{"):]
+                data = json.loads(json_part)
+                file_id = data.get("id")
+                
+            if file_id:
+                logger.info(f"✅ File uploaded to Google Drive. File ID: {file_id}")
+                config["gdrive_file_id"] = file_id
+                save_config(config)
+                
+                # Make the file public
+                logger.info("Setting public reader permissions on the Drive file...")
+                perm_cmd = [
+                    GWS_PATH, "drive", "permissions", "create",
+                    "--params", json.dumps({"fileId": file_id}),
+                    "--json", json.dumps({"role": "reader", "type": "anyone"})
+                ]
+                subprocess.run(perm_cmd, capture_output=True, text=True, check=True)
+                logger.info("✅ Drive file is now public.")
+            else:
+                logger.error(f"Failed to extract file ID from output: {out_text}")
+        except Exception as e:
+            logger.error(f"Error uploading to Google Drive: {e}")
+            return None
+    else:
+        logger.info(f"Updating existing file on Google Drive (File ID: {file_id})...")
+        cmd = [
+            GWS_PATH, "drive", "files", "update",
+            "--params", json.dumps({"fileId": file_id}),
+            "--upload", CSV_FILE
+        ]
+        try:
+            subprocess.run(cmd, capture_output=True, text=True, check=True)
+            logger.info("✅ Google Drive file updated successfully.")
+        except Exception as e:
+            logger.error(f"Error updating Google Drive file: {e}")
+            
+    if file_id:
+        return f"https://drive.google.com/uc?export=download&id={file_id}"
+    return None
 
 def main():
     token = get_gumroad_token()
@@ -128,25 +149,39 @@ def main():
         return
         
     if not os.path.exists(CSV_FILE):
-        logger.error(f"❌ Scraped database file {CSV_FILE} not found. Run scraper.py first.")
+        logger.error(f"❌ Leads database CSV file {CSV_FILE} not found. Run scraper.py first.")
         return
         
     config = load_config()
-    product_id = config.get("product_id")
     
+    # 1. Sync file to Google Drive and get download URL
+    download_url = sync_to_google_drive(config)
+    if not download_url:
+        logger.error("❌ Google Drive sync failed. Aborting.")
+        return
+        
+    # 2. Get or Create Gumroad Product
+    product_id = config.get("product_id")
     if not product_id:
-        product_id = create_product(token)
+        product_id = create_gumroad_product(token)
         if product_id:
             config["product_id"] = product_id
             save_config(config)
-        else:
-            return
             
-    # Upload/Update the CSV file
-    uploaded = upload_product_file(token, product_id, CSV_FILE)
-    if uploaded:
-        # Publish/Enable the product
-        publish_product(token, product_id)
+    # 3. Publish Gumroad Product
+    if product_id:
+        publish_gumroad_product(token, product_id)
+        
+    print("\n" + "="*50)
+    print("🚀 AUTOMATION PIPELINE COMPLETED SUCCESSFULLY!")
+    print(f"🔹 Gumroad Link: https://mgaral.gumroad.com/l/drmngt")
+    print(f"🔹 Direct Download Link (Google Drive): {download_url}")
+    print("\n📢 IMPORTANT:")
+    print("Go to your Gumroad Product Settings -> Content, select")
+    print("'Redirect to an external URL' and paste the Direct Download Link above.")
+    print("This only needs to be done ONCE. Future cron updates will overwrite")
+    print("the file in Google Drive, keeping the download URL constant!")
+    print("="*50 + "\n")
 
 if __name__ == "__main__":
     main()
