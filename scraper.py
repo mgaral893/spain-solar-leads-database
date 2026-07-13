@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """
-Spain Solar Leads Database Scraper (Enterprise-Grade Engine)
-============================================================
-Queries DuckDuckGo Lite programmatically for all 50 Spanish provinces.
-Crawls installer domains concurrently, parsing Home, Contact, Legal, and Privacy pages.
-Extracts: Name, Razón Social, CIF, Email, Phone, Website, Address, and Social Media links.
+Spain Solar Leads Database Scraper (Resilient Enterprise Engine v5)
+==================================================================
+Features:
+- Character Set Fix: Resolves r.apparent_encoding to fix character sets (á, é, í, ó, ú, ñ).
+- Checkpoint/Real-Time Saving: Appends verified leads directly to CSV.
+- HTML/JavaScript Filter: Discards code snippets from addresses.
+- Strict Name Cleansing: Strips SEO prefixes (numbers, years, symbols, directory spam).
+- Incremental Crawl: Load existing leads from CSV to skip previously crawled sites.
+- Dual-keyword Province & City Loop: Crawls 50 provinces and 50 cities using 3 query types.
 """
 import os
 import csv
@@ -14,6 +18,7 @@ import urllib3
 import logging
 import requests
 import html
+import threading
 from bs4 import BeautifulSoup
 from urllib.parse import urlparse, urljoin
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -23,28 +28,37 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # Setup Logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger("enterprise_leads_engine")
+logger = logging.getLogger("resilient_leads_engine")
 
 OUTPUT_CSV = "instaladores_solares_espana.csv"
-MAX_WORKERS = 10  # Speed up crawling with 10 threads concurrently
+MAX_WORKERS = 15
+FILE_LOCK = threading.Lock()
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, yike Gecko) Chrome/120.0.0.0 Safari/537.36"
 }
 
 # Regex definitions
 EMAIL_REGEX = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
 PHONE_REGEX = re.compile(r"\b(?:9|6|7)\d{2}[-.\s]?\d{3}[-.\s]?\d{3}\b|\b(?:9|6|7)\d{2}[-.\s]?\d{2}[-.\s]?\d{2}[-.\s]?\d{2}\b")
 CIF_REGEX = re.compile(r"\b[A-HJNP-SUVW][- ]?\d{7}[A-J\d]\b", re.IGNORECASE)
-POSTAL_CODE_REGEX = re.compile(r"\b(?:0[1-9]|[1-4][0-9]|5[0-2])\d{3}\b")  # Spanish ZIP codes (01000 - 52999)
+POSTAL_CODE_REGEX = re.compile(r"\b(?:0[1-9]|[1-4][0-9]|5[0-2])\d{3}\b")
 
-# Exclude popular aggregators, directory scrapers, and large media domains
+# Blocked domains (aggregators and spam)
 BLOCKED_DOMAINS = [
     "google.com", "duckduckgo.com", "facebook.com", "instagram.com", "linkedin.com",
     "twitter.com", "youtube.com", "selectra.es", "rankia.com", "renovables.blog",
     "eleconomista.es", "empresite", "paginasamarillas.es", "idealista.com", "wikipedia.org",
     "x.com", "pinterest.com", "milanuncios.com", "habitissimo.es", "twenergy.com",
-    "solarweb.net", "foro-electricidad.com", "top-conductores.es"
+    "solarweb.net", "foro-electricidad.com", "top-conductores.es", "solicitar-presupuesto",
+    "comparador", "comparasolar", "guiadeprensa", "soloempresas", "ahorrasolar", "certificados"
+]
+
+DUMMY_EMAILS = [
+    "tuemail@dominio.com", "info@tudominio.es", "tu@email.com", "email@domain.com",
+    "correo@correo.com", "user@example.com", "info@ejemplo.com", "admin@domain.com",
+    "test@test.com", "nombre@dominio.com", "ejemplo@ejemplo.com", "mail@example.com",
+    "tuemail@empresa.com", "seo.jesusarteaga@gmail.com"
 ]
 
 # 50 Spanish Provinces
@@ -58,28 +72,121 @@ PROVINCES = [
     "toledo", "valencia", "valladolid", "vizcaya", "zamora", "zaragoza"
 ]
 
+# 50 Largest Municipalities
+CITIES = [
+    "madrid", "barcelona", "valencia", "sevilla", "zaragoza", "malaga", "murcia", "palma de mallorca",
+    "las palmas de gran canaria", "bilbao", "alicante", "cordoba", "valladolid", "vigo", "gijon", "l hospitalet de llobregat",
+    "vitoria", "la coruña", "elche", "granada", "badalona", "oviedo", "cartagena", "sabadell",
+    "jerez de la frontera", "mostoles", "pamplona", "almeria", "alcala de henares", "fuenlabrada", "leganes",
+    "san sebastian", "getafe", "burgos", "albacete", "castellon de la plana", "santander", "alcorcon",
+    "logroño", "badajoz", "marbella", "salamanca", "huelva", "lleida", "tarragona", "dos hermanas",
+    "parla", "torrejon de ardoz", "leon"
+]
+
+LOCATIONS = sorted(list(set(PROVINCES + CITIES)))
+
+def clean_company_name(name):
+    """Clean company name of HTML characters, emojis, years, SEO suffixes and numbers."""
+    if not name:
+        return ""
+    name = html.unescape(name)
+    name = re.split(r"\||-|—|::", name)[0].strip()
+    name = re.sub(r"<[^>]+>", "", name)
+    name = name.strip("※ *•_#-()[]{}▷▶★✔")
+    name = re.sub(r"\b202\d\b", "", name).strip()
+    name = re.sub(r"^\d+\s*", "", name).strip()
+    
+    for phrase in ["Directorio de", "Los mejores", "Instaladores de", "Empresas de"]:
+        if name.lower().startswith(phrase.lower()):
+            name = name[len(phrase):].strip()
+            
+    # Resolve double-encoding glitches
+    name = name.replace("Ã³", "ó").replace("ã³", "ó").replace("Â·", "·").replace("Ã¡", "á").replace("Ã©", "é").replace("Ã­", "í").replace("Ãº", "ú").replace("Ã±", "ñ").replace("Ã‘", "Ñ").replace("Ã", "á")
+    name = " ".join([w.capitalize() for w in name.split()])
+    return name
+
+def clean_phone(phone):
+    """Normalize phone numbers to international standard +34 6XX XX XX XX."""
+    if not phone:
+        return ""
+    digits = "".join(re.findall(r"\d", phone))
+    
+    if digits in ["999999999", "123456789", "000000000"]:
+        return ""
+        
+    if digits.startswith("34") and len(digits) > 9:
+        digits = digits[2:]
+        
+    if len(digits) == 9:
+        return f"+34 {digits[0:3]} {digits[3:5]} {digits[5:7]} {digits[7:9]}"
+    elif len(digits) > 9:
+        return f"+34 {digits[-9:-6]} {digits[-6:-4]} {digits[-4:-2]} {digits[-2:]}"
+    return phone.strip()
+
+def clean_address(address):
+    """Strictly validates address and discards HTML/CSS/JavaScript code leakages."""
+    if not address:
+        return ""
+        
+    address = html.unescape(address)
+    code_indicators = [
+        "{", "}", "[", "]", "class=", "id=", "href=", "src=", "menu-item", 
+        "span", "div", "script", "function", "var ", "const ", "let ", "//#", 
+        "/*", "*/", "import ", "document.", "window.", "elementor", "wpa_field",
+        "margin:", "padding:", "display:", "color:", "z-index", "href"
+    ]
+    address_lower = address.lower()
+    if any(ind in address_lower for ind in code_indicators):
+        return ""
+        
+    address = re.sub(r"<[^>]+>", "", address)
+    address = " ".join(address.split())
+    address = address.strip(" ,.-:;()[]")
+    
+    # Clean double-encoding
+    address = address.replace("Ã³", "ó").replace("ã³", "ó").replace("Â·", "·").replace("Ã¡", "á").replace("Ã©", "é").replace("Ã­", "í").replace("Ãº", "ú").replace("Ã±", "ñ").replace("Ã‘", "Ñ").replace("Ã", "á")
+    address = " ".join([w.capitalize() for w in address.split()])
+    return address
+
+def clean_cif(cif):
+    """Standardizes Spanish CIF format to uppercase."""
+    if not cif:
+        return ""
+    cif = cif.upper().replace(" ", "").replace("-", "").strip()
+    if len(cif) == 9 and cif[0].isalpha():
+        return cif
+    return ""
+
+def is_valid_email(email):
+    """Validates email is not a placeholder template."""
+    if not email:
+        return False
+    email = email.lower().strip()
+    if email in DUMMY_EMAILS:
+        return False
+    if any(email.startswith(dummy.split("@")[0]) for dummy in DUMMY_EMAILS if "@" in dummy):
+        if "dominio" in email or "example" in email:
+            return False
+    if any(email.endswith(ext) for ext in [".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".js", ".css"]):
+        return False
+    return "@" in email
+
 def search_ddg_lite(query):
-    """Query DuckDuckGo Lite HTML search and return unique full URLs with retry logic."""
+    """Query DuckDuckGo Lite HTML search and return unique full URLs."""
     url = "https://lite.duckduckgo.com/lite/"
     data = {"q": query}
     links = set()
     
-    # Retry configuration for anti-bot resilience
     retries = 3
-    delay = 8
+    delay = 6
     
     for attempt in range(retries):
         try:
-            logger.info(f"Sending search request (attempt {attempt + 1}/{retries})...")
             r = requests.post(url, data=data, headers=HEADERS, timeout=12)
-            
             if r.status_code == 200:
                 soup = BeautifulSoup(r.text, "html.parser")
-                
-                # Verify if actual search results are returned
                 result_elements = soup.find_all("a", class_="result-link")
                 if not result_elements:
-                    logger.warning(f"No result-link elements found (possible challenge page). Retrying in {delay}s...")
                     time.sleep(delay)
                     delay *= 2
                     continue
@@ -93,37 +200,35 @@ def search_ddg_lite(query):
                         
                     if domain and not any(b in domain for b in BLOCKED_DOMAINS):
                         links.add(f"{parsed.scheme}://{parsed.netloc}")
-                
-                # If we successfully parsed results, break the retry loop
                 if links:
                     break
             else:
-                logger.warning(f"Search endpoint returned HTTP {r.status_code}. Retrying in {delay}s...")
                 time.sleep(delay)
                 delay *= 2
-        except Exception as e:
-            logger.warning(f"Error during search request: {e}. Retrying in {delay}s...")
+        except Exception:
             time.sleep(delay)
             delay *= 2
             
     return links
 
-
 def extract_razon_social(text):
     """Tries to extract Spanish corporate names (Razón Social) containing S.L., S.A., etc."""
-    # Find lines or sentences matching standard Spanish corporate suffix structures
-    matches = re.findall(r"\b([A-Z0-9\s,.-]+?\s(?:S\.?L\.?|S\.?A\.?|S\.?L\.?U\.?|S\.?A\.?U\.?))\b", text)
+    matches = re.findall(r"\b([A-Z0-9\s,.-]{4,45}\s(?:S\.?L\.?|S\.?A\.?|S\.?L\.?U\.?|S\.?A\.?U\.?))\b", text)
     if matches:
-        # Return first matches cleaned of extra whitespace
-        cleaned = [m.strip().replace("\n", " ") for m in matches if len(m.strip()) > 3]
+        cleaned = []
+        for m in matches:
+            c = m.strip().replace("\n", " ")
+            c = re.sub(r"\s+", " ", c)
+            if len(c) > 6 and not any(k in c.lower() for k in ["de s.l", "en s.l", "para s.l"]):
+                cleaned.append(c)
         if cleaned:
-            return cleaned[0]
+            val = " ".join([w.capitalize() if not w.isupper() else w for w in cleaned[0].split()])
+            return val.replace("Ã³", "ó").replace("ã³", "ó").replace("Â·", "·").replace("Ã¡", "á").replace("Ã©", "é").replace("Ã­", "í").replace("Ãº", "ú").replace("Ã±", "ñ").replace("Ã‘", "Ñ").replace("Ã", "á")
             
-    # Fallback to look for labels
-    label_match = re.search(r"(?:razón|denominación)\s+social:?\s*([^\n.,;]+)", text, re.IGNORECASE)
+    label_match = re.search(r"(?:razón|denominación)\s+social:?\s*([^\n.,;]{3,45})", text, re.IGNORECASE)
     if label_match:
-        return label_match.group(1).strip()
-        
+        val = label_match.group(1).strip()
+        return val.replace("Ã³", "ó").replace("ã³", "ó").replace("Â·", "·").replace("Ã¡", "á").replace("Ã©", "é").replace("Ã­", "í").replace("Ãº", "ú").replace("Ã±", "ñ").replace("Ã‘", "Ñ").replace("Ã", "á")
     return ""
 
 def extract_social_links(soup, base_url):
@@ -138,7 +243,7 @@ def extract_social_links(soup, base_url):
     return socials
 
 def crawl_company_site(base_url, province_name=""):
-    """Crawls website and returns complete structured B2B lead info."""
+    """Crawls website and returns complete cleaned B2B lead info."""
     lead = {
         "name": "",
         "razon_social": "",
@@ -157,34 +262,32 @@ def crawl_company_site(base_url, province_name=""):
         if r.status_code != 200:
             return None
             
+        r.encoding = r.apparent_encoding or "utf-8"
         soup = BeautifulSoup(r.text, "html.parser")
         
-        # 1. Company Name from Title
+        # Company Name
         title_tag = soup.find("title")
         if title_tag:
-            title = title_tag.text.strip()
-            for sep in ["|", "-", "—"]:
-                if sep in title:
-                    title = title.split(sep)[0].strip()
-            lead["name"] = title
+            lead["name"] = clean_company_name(title_tag.text)
             
-        # Extract metadata from homepage
         html_text = r.text
         
-        # Parse basic social links from homepage
+        # Social links
         socials = extract_social_links(soup, base_url)
         lead.update(socials)
         
-        # Extract emails & phones
+        # Emails & phones
         emails = EMAIL_REGEX.findall(html_text)
         phones = PHONE_REGEX.findall(html_text)
         
-        if emails:
-            lead["email"] = [e for e in set(emails) if not e.endswith(('.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp', '.js', '.css'))][0]
-        if phones:
-            lead["phone"] = phones[0]
+        valid_emails = [e for e in set(emails) if is_valid_email(e)]
+        if valid_emails:
+            lead["email"] = valid_emails[0].lower().strip()
             
-        # 2. Scan internal legal and contact links for deep harvesting (CIF, Razón Social)
+        if phones:
+            lead["phone"] = clean_phone(phones[0])
+            
+        # Deep scan legal pages
         subpages = []
         for a in soup.find_all("a", href=True):
             href = a["href"].lower()
@@ -193,83 +296,135 @@ def crawl_company_site(base_url, province_name=""):
                 sub_url = urljoin(base_url, a["href"])
                 subpages.append(sub_url)
                 
-        subpages = list(set(subpages))[:3]  # Scan up to 3 legal/contact subpages
+        subpages = list(set(subpages))[:3]
         
         for sub_url in subpages:
             try:
                 sub_r = requests.get(sub_url, headers=HEADERS, verify=False, timeout=5)
                 if sub_r.status_code == 200:
-                    sub_soup = BeautifulSoup(sub_r.text, "html.parser")
+                    sub_r.encoding = sub_r.apparent_encoding or "utf-8"
                     sub_text = sub_r.text
                     
-                    # Deep harvest emails & phones if missing
                     if not lead["email"]:
                         sub_emails = EMAIL_REGEX.findall(sub_text)
-                        if sub_emails:
-                            lead["email"] = [e for e in set(sub_emails) if not e.endswith(('.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp', '.js', '.css'))][0]
+                        valid_sub_emails = [e for e in set(sub_emails) if is_valid_email(e)]
+                        if valid_sub_emails:
+                            lead["email"] = valid_sub_emails[0].lower().strip()
                     if not lead["phone"]:
                         sub_phones = PHONE_REGEX.findall(sub_text)
                         if sub_phones:
-                            lead["phone"] = sub_phones[0]
+                            lead["phone"] = clean_phone(sub_phones[0])
                             
-                    # Harvest CIF/Tax ID
                     if not lead["cif"]:
                         cif_match = CIF_REGEX.search(sub_text)
                         if cif_match:
-                            lead["cif"] = cif_match.group(0).upper().replace(" ", "").replace("-", "")
+                            lead["cif"] = clean_cif(cif_match.group(0))
                             
-                    # Harvest Razón Social (Legal Entity Name)
                     if not lead["razon_social"]:
                         rs = extract_razon_social(sub_text)
                         if rs:
                             lead["razon_social"] = rs
                             
-                    # Harvest Address / Zip code
                     if not lead["address"]:
                         zip_match = POSTAL_CODE_REGEX.search(sub_text)
                         if zip_match:
-                            # Try to extract the line surrounding the zip code as address snippet
                             zip_idx = sub_text.find(zip_match.group(0))
-                            start = max(0, zip_idx - 60)
-                            end = min(len(sub_text), zip_idx + 60)
+                            start = max(0, zip_idx - 65)
+                            end = min(len(sub_text), zip_idx + 65)
                             snippet = sub_text[start:end].replace("\n", " ").strip()
-                            # Strip HTML tags
-                            snippet = re.sub(r"<[^>]+>", "", snippet)
-                            lead["address"] = " ".join(snippet.split()[:8])
+                            lead["address"] = clean_address(snippet)
             except Exception:
                 pass
                 
-    except Exception as e:
-        logger.debug(f"Failed to crawl website {base_url}: {e}")
+    except Exception:
         return None
+        
+    if not lead["name"]:
+        parsed = urlparse(base_url)
+        domain = parsed.netloc.lower().replace("www.", "").split(".")[0]
+        lead["name"] = domain.capitalize()
         
     return lead
 
-def build_database(max_queries=14):
+def load_existing_leads():
+    """Loads existing leads from CSV to skip redundant crawls."""
+    seen_websites = set()
+    seen_contacts = set()
+    
+    if os.path.exists(OUTPUT_CSV):
+        try:
+            with open(OUTPUT_CSV, mode="r", encoding="utf-8") as f:
+                reader = csv.reader(f)
+                header = next(reader, None)
+                if header:
+                    for row in reader:
+                        if len(row) >= 6:
+                            email = row[3].lower().strip()
+                            phone = row[4].strip()
+                            web = row[5].lower().strip()
+                            
+                            seen_websites.add(web)
+                            if email:
+                                seen_contacts.add(email)
+                            if phone:
+                                seen_contacts.add(phone)
+            logger.info(f"Loaded {len(seen_websites)} existing lead websites from {OUTPUT_CSV}")
+        except Exception as e:
+            logger.warning(f"Could not parse existing CSV: {e}")
+            
+    return seen_websites, seen_contacts
+
+def append_lead_to_csv(lead):
+    """Appends a single lead row to the CSV file in a thread-safe manner."""
+    with FILE_LOCK:
+        file_exists = os.path.exists(OUTPUT_CSV)
+        with open(OUTPUT_CSV, mode="a", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            if not file_exists:
+                writer.writerow([
+                    "Empresa", "Razón Social", "CIF", "Email", "Teléfono", 
+                    "Sitio Web", "Dirección", "Provincia", "LinkedIn", "Facebook"
+                ])
+            writer.writerow([
+                lead["name"], lead["razon_social"], lead["cif"], lead["email"], lead["phone"],
+                lead["website"], lead["address"], lead["province"], lead["linkedin"], lead["facebook"]
+            ])
+
+def build_database(max_queries=100):
     """Gathers B2B leads from search engine and crawls them concurrently."""
-    logger.info("Initializing High-Performance B2B Leads Engine...")
+    logger.info("Initializing Resilient B2B Leads Engine v5...")
+    
+    seen_websites, seen_contacts = load_existing_leads()
     all_domains = {}
     
-    # 1. Gather domains by province query
-    queries_to_run = PROVINCES[:max_queries]
-    for idx, prov in enumerate(queries_to_run):
-        q = f"instaladores placas solares {prov}"
-        logger.info(f"[{idx+1}/{len(queries_to_run)}] Querying DuckDuckGo: {q!r}")
-        found_urls = search_ddg_lite(q)
-        for url in found_urls:
-            parsed = urlparse(url)
-            domain = parsed.netloc.lower()
-            if domain.startswith("www."):
-                domain = domain[4:]
-            if domain not in all_domains:
-                all_domains[domain] = (url, prov)
-        time.sleep(7.0)
+    # 2. Gather domains by province & city
+    queries_to_run = LOCATIONS[:max_queries]
+    for idx, loc in enumerate(queries_to_run):
+        # Loop through three high-yield B2B queries per location
+        for query_type in ["instaladores placas solares", "empresas energia solar", "autoconsumo solar"]:
+            q = f"{query_type} {loc}"
+            logger.info(f"[{idx+1}/{len(queries_to_run)}] Querying DuckDuckGo: {q!r}")
+            found_urls = search_ddg_lite(q)
+            for url in found_urls:
+                parsed = urlparse(url)
+                domain = parsed.netloc.lower()
+                if domain.startswith("www."):
+                    domain = domain[4:]
+                
+                clean_url = f"{parsed.scheme}://{parsed.netloc}"
+                # Deduplicate against existing data and current run domains
+                if clean_url.lower().strip() not in seen_websites and domain not in all_domains:
+                    all_domains[domain] = (clean_url, loc)
+            time.sleep(7.0)
         
-    logger.info(f"Target installer domains collected: {len(all_domains)}")
-    
-    # 2. Crawl domains concurrently using ThreadPoolExecutor
-    leads = []
+    logger.info(f"Target NEW unique installer domains collected: {len(all_domains)}")
+    if not all_domains:
+        logger.info("No new domains to crawl. Database is up to date!")
+        return
+        
+    # 3. Crawl domains concurrently
     logger.info(f"Launching parallel crawler with {MAX_WORKERS} workers...")
+    new_leads_count = 0
     
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         future_to_url = {
@@ -281,40 +436,24 @@ def build_database(max_queries=14):
             url = future_to_url[future]
             try:
                 lead = future.result()
-                if lead and (lead["email"] or lead["phone"]):
-                    # Strip any HTML entity characters
-                    for k in lead:
-                        if isinstance(lead[k], str):
-                            lead[k] = html.unescape(lead[k]).strip()
+                if lead and (is_valid_email(lead["email"]) or lead["phone"]):
+                    lead["name"] = clean_company_name(lead["name"])
+                    
+                    if len(lead["name"]) > 2:
+                        contact_key = lead["email"] if lead["email"] else lead["phone"]
+                        
+                        if contact_key not in seen_contacts:
+                            seen_contacts.add(contact_key)
                             
-                    # Skip garbage capture results
-                    if "@" in lead["email"] and not any(ext in lead["email"].lower() for ext in [".webp", ".png", ".jpg", ".js", ".css"]):
-                        logger.info(f"✅ Lead Found: {lead['name']} | CIF: {lead['cif']} | Email: {lead['email']}")
-                        leads.append(lead)
+                            # Append to CSV in real-time
+                            append_lead_to_csv(lead)
+                            new_leads_count += 1
+                            logger.info(f"✅ Clean Lead saved ({new_leads_count} new): {lead['name']} | CIF: {lead['cif']} | Email: {lead['email']} | Tel: {lead['phone']}")
             except Exception as e:
                 logger.error(f"Error crawling worker result for {url}: {e}")
                 
-    # 3. Write structured database to CSV
-    if leads:
-        # Sort leads alphabetically
-        leads.sort(key=lambda x: x["name"])
-        
-        with open(OUTPUT_CSV, mode="w", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow([
-                "Empresa", "Razón Social", "CIF", "Email", "Teléfono", 
-                "Sitio Web", "Dirección", "Provincia", "LinkedIn", "Facebook"
-            ])
-            for l in leads:
-                writer.writerow([
-                    l["name"], l["razon_social"], l["cif"], l["email"], l["phone"],
-                    l["website"], l["address"], l["province"], l["linkedin"], l["facebook"]
-                ])
-                
-        logger.info(f"🥇 HIGH-POWERED SCRAPING COMPLETE! {len(leads)} B2B leads written to {OUTPUT_CSV}")
-    else:
-        logger.warning("No B2B leads could be extracted.")
+    logger.info(f"🥇 PREMIUM RESILIENT CRAWL COMPLETE! Added {new_leads_count} clean leads directly to {OUTPUT_CSV}")
 
 if __name__ == "__main__":
-    # Cover 14 regions for standard runs (can run all 50 in cron jobs!)
-    build_database(max_queries=14)
+    # Cover the entire expanded locations list!
+    build_database(max_queries=100)
