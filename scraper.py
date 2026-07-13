@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 """
-Spain Solar Leads Database Scraper (Resilient Enterprise Engine v5)
-==================================================================
+Spain Solar Leads Database Scraper (Resilient Enterprise Harvester v6)
+===================================================================
 Features:
-- Character Set Fix: Resolves r.apparent_encoding to fix character sets (á, é, í, ó, ú, ñ).
-- Checkpoint/Real-Time Saving: Appends verified leads directly to CSV.
-- HTML/JavaScript Filter: Discards code snippets from addresses.
-- Strict Name Cleansing: Strips SEO prefixes (numbers, years, symbols, directory spam).
-- Incremental Crawl: Load existing leads from CSV to skip previously crawled sites.
-- Dual-keyword Province & City Loop: Crawls 50 provinces and 50 cities using 3 query types.
+- Dual-Engine Harvester: Combines UNEF Associate Directory and DuckDuckGo query loops.
+- Apparent Encoding Override: Uses r.apparent_encoding to eliminate double-encoding errors.
+- Thread-Safe Real-time Saving: Saves verified leads instantly to CSV.
+- Refined Address & Name Cleaners: Filters out JS/CSS/HTML noise.
+- Incremental Deduplication: Skips previously harvested websites.
 """
 import os
 import csv
@@ -28,14 +27,14 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # Setup Logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger("resilient_leads_engine")
+logger = logging.getLogger("leads_harvester")
 
 OUTPUT_CSV = "instaladores_solares_espana.csv"
 MAX_WORKERS = 15
 FILE_LOCK = threading.Lock()
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, yike Gecko) Chrome/120.0.0.0 Safari/537.36"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 }
 
 # Regex definitions
@@ -61,7 +60,6 @@ DUMMY_EMAILS = [
     "tuemail@empresa.com", "seo.jesusarteaga@gmail.com"
 ]
 
-# 50 Spanish Provinces
 PROVINCES = [
     "albacete", "alicante", "almeria", "asturias", "avila", "badajoz", "barcelona",
     "burgos", "caceres", "cadiz", "cantabria", "castellon", "ciudad real", "cordoba",
@@ -72,7 +70,6 @@ PROVINCES = [
     "toledo", "valencia", "valladolid", "vizcaya", "zamora", "zaragoza"
 ]
 
-# 50 Largest Municipalities
 CITIES = [
     "madrid", "barcelona", "valencia", "sevilla", "zaragoza", "malaga", "murcia", "palma de mallorca",
     "las palmas de gran canaria", "bilbao", "alicante", "cordoba", "valladolid", "vigo", "gijon", "l hospitalet de llobregat",
@@ -100,8 +97,8 @@ def clean_company_name(name):
         if name.lower().startswith(phrase.lower()):
             name = name[len(phrase):].strip()
             
-    # Resolve double-encoding glitches
-    name = name.replace("Ã³", "ó").replace("ã³", "ó").replace("Â·", "·").replace("Ã¡", "á").replace("Ã©", "é").replace("Ã­", "í").replace("Ãº", "ú").replace("Ã±", "ñ").replace("Ã‘", "Ñ").replace("Ã", "á")
+    # Resolve typical UTF-8 double-encoding glitches
+    name = name.replace("Ã³", "ó").replace("ã³", "ó").replace("Â·", "·").replace("ã³", "ó").replace("Ã¡", "á").replace("Ã©", "é").replace("Ã­", "í").replace("Ãº", "ú").replace("Ã±", "ñ").replace("Ã‘", "Ñ").replace("Ã", "á")
     name = " ".join([w.capitalize() for w in name.split()])
     return name
 
@@ -210,6 +207,104 @@ def search_ddg_lite(query):
             delay *= 2
             
     return links
+
+def harvest_unef_profiles():
+    """Loops through all pages of the UNEF associate directory and gathers all profile links."""
+    logger.info("Harvesting associate profiles from UNEF directory...")
+    profile_urls = set()
+    
+    # 1. Fetch Page 1 links
+    try:
+        r = requests.get("https://www.unef.es/es/asociados", headers=HEADERS, verify=False, timeout=10)
+        if r.status_code == 200:
+            soup = BeautifulSoup(r.text, "html.parser")
+            for a in soup.find_all("a", href=True):
+                if "/es/asociado/" in a["href"]:
+                    profile_urls.add(a["href"])
+    except Exception as e:
+        logger.error(f"UNEF Page 1 error: {e}")
+        
+    logger.info(f"Page 1 fetched: {len(profile_urls)} profiles.")
+    
+    # 2. Fetch remaining pages dynamically via AJAX pagination
+    url = "https://www.unef.es/es/asociadosFront/ajaxCargarMasAsociados"
+    unef_headers = HEADERS.copy()
+    unef_headers["X-Requested-With"] = "XMLHttpRequest"
+    
+    page = 2
+    while True:
+        data = {
+            "pagina": page,
+            "busqueda": "",
+            "idComunidadActividad": "",
+            "idTipoActividad": "",
+            "idSeccion": ""
+        }
+        try:
+            r = requests.post(url, headers=unef_headers, data=data, verify=False, timeout=12)
+            if r.status_code == 200:
+                res = r.json()
+                html_content = res.get("data", {}).get("html", "")
+                soup = BeautifulSoup(html_content, "html.parser")
+                cards = soup.find_all("a", href=True)
+                page_links = 0
+                for a in cards:
+                    if "/es/asociado/" in a["href"]:
+                        profile_urls.add(a["href"])
+                        page_links += 1
+                        
+                logger.info(f"UNEF Page {page} read: added {page_links} profiles. Cumulative unique: {len(profile_urls)}")
+                
+                if res.get("data", {}).get("hayMas", 0) <= 0 or page_links == 0:
+                    break
+                    
+                page += 1
+                time.sleep(1.0) # Safe delay
+            else:
+                logger.warning(f"UNEF AJAX HTTP error {r.status_code} at page {page}.")
+                break
+        except Exception as e:
+            logger.error(f"UNEF AJAX error on page {page}: {e}. Retrying with extra sleep...")
+            time.sleep(4.0)
+            continue
+            
+    return list(profile_urls)
+
+def extract_corporate_website_from_unef(profile_url):
+    """Parses a UNEF associate profile page and extracts its official corporate website and region."""
+    company_info = {"website": "", "province": ""}
+    try:
+        r = requests.get(profile_url, headers=HEADERS, verify=False, timeout=8)
+        if r.status_code == 200:
+            r.encoding = r.apparent_encoding or "utf-8"
+            soup = BeautifulSoup(r.text, "html.parser")
+            
+            # Extract province
+            text_blocks = soup.get_text()
+            province_match = re.search(r"Provincia:\s*([^\n,.;]+)", text_blocks, re.IGNORECASE)
+            if province_match:
+                company_info["province"] = clean_company_name(province_match.group(1)).capitalize()
+            
+            # Extract corporate website
+            for a in soup.find_all("a", href=True):
+                href = a["href"].strip()
+                href_lower = href.lower()
+                if (href_lower.startswith("http") and 
+                    "unef.es" not in href_lower and 
+                    "linkedin.com" not in href_lower and 
+                    "facebook.com" not in href_lower and 
+                    "twitter.com" not in href_lower and 
+                    "youtube.com" not in href_lower and 
+                    "eepurl.com" not in href_lower and 
+                    "globalsolarcouncil.org" not in href_lower and 
+                    "solarpowereurope.org" not in href_lower and 
+                    "alianzaautoconsumo.org" not in href_lower and 
+                    "observatorirenovables.cat" not in href_lower):
+                    company_info["website"] = href
+                    break
+    except Exception:
+        pass
+    return company_info
 
 def extract_razon_social(text):
     """Tries to extract Spanish corporate names (Razón Social) containing S.L., S.A., etc."""
@@ -390,40 +485,75 @@ def append_lead_to_csv(lead):
                 lead["website"], lead["address"], lead["province"], lead["linkedin"], lead["facebook"]
             ])
 
-def build_database(max_queries=100):
-    """Gathers B2B leads from search engine and crawls them concurrently."""
-    logger.info("Initializing Resilient B2B Leads Engine v5...")
+def build_database(max_queries=15):
+    """Dual-Engine B2B leads harvester."""
+    logger.info("Initializing Resilient B2B Leads Harvester v6...")
     
     seen_websites, seen_contacts = load_existing_leads()
     all_domains = {}
     
-    # 2. Gather domains by province & city
-    queries_to_run = LOCATIONS[:max_queries]
-    for idx, loc in enumerate(queries_to_run):
-        # Loop through three high-yield B2B queries per location
-        for query_type in ["instaladores placas solares", "empresas energia solar", "autoconsumo solar"]:
-            q = f"{query_type} {loc}"
-            logger.info(f"[{idx+1}/{len(queries_to_run)}] Querying DuckDuckGo: {q!r}")
-            found_urls = search_ddg_lite(q)
-            for url in found_urls:
-                parsed = urlparse(url)
-                domain = parsed.netloc.lower()
-                if domain.startswith("www."):
-                    domain = domain[4:]
-                
-                clean_url = f"{parsed.scheme}://{parsed.netloc}"
-                # Deduplicate against existing data and current run domains
-                if clean_url.lower().strip() not in seen_websites and domain not in all_domains:
-                    all_domains[domain] = (clean_url, loc)
-            time.sleep(7.0)
+    # --- ENGINE 1: UNEF Associate Directory Harvester (High-Quality Targets) ---
+    try:
+        profile_urls = harvest_unef_profiles()
+        logger.info(f"UNEF directory yielded {len(profile_urls)} associate profile links. Starting parallel profile extraction...")
         
-    logger.info(f"Target NEW unique installer domains collected: {len(all_domains)}")
+        extracted_count = 0
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            future_to_prof = {
+                executor.submit(extract_corporate_website_from_unef, url): url 
+                for url in profile_urls
+            }
+            for future in as_completed(future_to_prof):
+                prof_url = future_to_prof[future]
+                try:
+                    info = future.result()
+                    web = info.get("website")
+                    prov = info.get("province") or "Spain"
+                    if web:
+                        parsed = urlparse(web)
+                        domain = parsed.netloc.lower()
+                        if domain.startswith("www."):
+                            domain = domain[4:]
+                        
+                        clean_url = f"{parsed.scheme}://{parsed.netloc}"
+                        if clean_url.lower().strip() not in seen_websites and domain not in all_domains:
+                            all_domains[domain] = (clean_url, prov)
+                            extracted_count += 1
+                except Exception as e:
+                    logger.debug(f"Failed extracting website from profile {prof_url}: {e}")
+                    
+        logger.info(f"UNEF harvesting complete! Collected {extracted_count} new installer corporate sites.")
+    except Exception as err:
+        logger.error(f"UNEF Engine error: {err} (falling back entirely to DuckDuckGo)")
+        
+    # --- ENGINE 2: DuckDuckGo Search Engine Fallback & Expansion ---
+    if len(all_domains) < 100:
+        logger.info("Expanding lead scope with DuckDuckGo search engine...")
+        # Query first max_queries locations
+        queries_to_run = LOCATIONS[:max_queries]
+        for idx, loc in enumerate(queries_to_run):
+            for query_type in ["instaladores placas solares", "empresas energia solar"]:
+                q = f"{query_type} {loc}"
+                logger.info(f"[{idx+1}/{len(queries_to_run)}] Querying DuckDuckGo: {q!r}")
+                found_urls = search_ddg_lite(q)
+                for url in found_urls:
+                    parsed = urlparse(url)
+                    domain = parsed.netloc.lower()
+                    if domain.startswith("www."):
+                        domain = domain[4:]
+                    
+                    clean_url = f"{parsed.scheme}://{parsed.netloc}"
+                    if clean_url.lower().strip() not in seen_websites and domain not in all_domains:
+                        all_domains[domain] = (clean_url, loc)
+                time.sleep(6.0)
+                
+    logger.info(f"Total NEW unique installer domains collected for deep crawl: {len(all_domains)}")
     if not all_domains:
         logger.info("No new domains to crawl. Database is up to date!")
         return
         
-    # 3. Crawl domains concurrently
-    logger.info(f"Launching parallel crawler with {MAX_WORKERS} workers...")
+    # --- ENGINE 3: Deep Crawler (Concurrent Website Scraping) ---
+    logger.info(f"Launching deep concurrent crawler with {MAX_WORKERS} workers...")
     new_leads_count = 0
     
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
@@ -450,10 +580,9 @@ def build_database(max_queries=100):
                             new_leads_count += 1
                             logger.info(f"✅ Clean Lead saved ({new_leads_count} new): {lead['name']} | CIF: {lead['cif']} | Email: {lead['email']} | Tel: {lead['phone']}")
             except Exception as e:
-                logger.error(f"Error crawling worker result for {url}: {e}")
+                logger.error(f"Error crawling website {url}: {e}")
                 
-    logger.info(f"🥇 PREMIUM RESILIENT CRAWL COMPLETE! Added {new_leads_count} clean leads directly to {OUTPUT_CSV}")
+    logger.info(f"🥇 PREMIUM HARVEST COMPLETE! Added {new_leads_count} clean leads directly to {OUTPUT_CSV}")
 
 if __name__ == "__main__":
-    # Cover the entire expanded locations list!
-    build_database(max_queries=100)
+    build_database(max_queries=15)
