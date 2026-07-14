@@ -18,7 +18,7 @@ logger = logging.getLogger("sync_engine")
 CONFIG_FILE = "gumroad_config.json"
 CSV_FILE = "instaladores_solares_espana.csv"
 GWS_PATH = "/home/ubuntu/.local/bin/gws"
-GDRIVE_PARENT_FOLDER = "1iOg0JEXQokgW16LQMsezeSm_-rIF_6h9"
+GDRIVE_PARENT_FOLDER = "1wFHPjlD-l_kpjYRPeewBR_FpJJKBzET_"
 
 def get_gumroad_token():
     token = os.environ.get("GUMROAD_TOKEN")
